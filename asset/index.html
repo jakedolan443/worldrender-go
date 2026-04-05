@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WORLDVIEWER</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=VT323&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0f1a2a; overflow: hidden; }
+canvas { display: block; cursor: grab; }
+canvas.dragging { cursor: grabbing; }
+.card {
+  background: #fff;
+  border: 2px solid #000;
+  border-radius: 10px;
+  padding: 18px 20px;
+  color: #000;
+}
+.card-header {
+  font-family: 'VT323', monospace;
+  font-size: 36px;
+  line-height: 1;
+  letter-spacing: 0.04em;
+  margin-bottom: 10px;
+  white-space: nowrap;
+}
+.card-text {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.card-text a { color: #000; }
+#panel-main { position: fixed; top: 16px; left: 16px; width: fit-content; z-index: 100; }
+#tooltip {
+  position: fixed;
+  pointer-events: none;
+  background: rgba(0,0,0,0.85);
+  color: #e0e0e0;
+  padding: 6px 12px;
+  border-radius: 4px;
+  font: 13px 'Share Tech Mono', monospace;
+  display: none;
+  white-space: nowrap;
+  border: 1px solid rgba(255,255,255,0.15);
+}
+#loading {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%,-50%);
+  background: rgba(0,0,0,0.9);
+  color: #e0e0e0;
+  padding: 20px 40px;
+  border-radius: 8px;
+  font: 14px 'Share Tech Mono', monospace;
+}
+</style>
+</head>
+<body>
+<div id="loading">Loading map data...</div>
+<canvas id="c"></canvas>
+<div id="tooltip"></div>
+<div id="panel-main" class="card">
+  <div class="card-header">WORLDVIEWER</div>
+  <div class="card-text">
+    Drag to pan. Scroll to zoom.<br>
+    Hover a country to identify it.<br>
+    Gold = western-aligned nations.<br>
+    <a href="https://github.com/jakedolan443/ebiten-web-worldrender" target="_blank">github.com/jakedolan443/ebiten-web-worldrender</a>
+  </div>
+</div>
+<script>
+"use strict";
+
+let DATA = null;
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const tooltip = document.getElementById("tooltip");
+const loadingDiv = document.getElementById("loading");
+let W, H, camX = 0, camY = 0, zoom = 5;
+
+const MAX_ZOOM = 80;
+let MIN_ZOOM = 3;
+const WORLD_W = 360, WORLD_H = 180;
+const OCEAN = "#0f1a2a", LAND = "#464b50", LAND_W = "#8a7e3a";
+const BORDER = "rgba(255,255,255,0.18)", BORDER_HOVER = "rgba(255,200,80,0.5)";
+const LAND_HOVER = "#555a60", LAND_W_HOVER = "#9e9145";
+
+async function initMap() {
+  try {
+    const r = await fetch("/api/map", { headers: { "Accept-Encoding": "gzip" } });
+    if (!r.ok) throw new Error(r.status);
+    DATA = await r.json();
+    loadingDiv.style.display = "none";
+    setupMap();
+  } catch (e) {
+    loadingDiv.textContent = "Error loading map: " + e.message;
+  }
+}
+
+function setupMap() {
+  function lonToX(lon) { return (lon + 180) * zoom + camX; }
+  function latToY(lat) { return (90 - lat) * zoom + camY; }
+  function xToLon(x)   { return (x - camX) / zoom - 180; }
+  function yToLat(y)   { return 90 - (y - camY) / zoom; }
+
+  function clampCamera() {
+    const mw = WORLD_W * zoom, mh = WORLD_H * zoom;
+    camX = mw <= W ? (W - mw) / 2 : Math.min(0, Math.max(W - mw, camX));
+    camY = mh <= H ? (H - mh) / 2 : Math.min(0, Math.max(H - mh, camY));
+  }
+
+  function resize() {
+    W = canvas.width  = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+    MIN_ZOOM = H / WORLD_H;
+    if (zoom < MIN_ZOOM) zoom = MIN_ZOOM;
+    clampCamera();
+    draw();
+  }
+
+  function drawPoly(pts) {
+    ctx.beginPath();
+    let prev = pts[0][0];
+    ctx.moveTo(lonToX(prev), latToY(pts[0][1]));
+    for (let i = 1; i < pts.length; i++) {
+      let lon = pts[i][0];
+      while (lon - prev >  180) lon -= 360;
+      while (prev - lon >  180) lon += 360;
+      ctx.lineTo(lonToX(lon), latToY(pts[i][1]));
+      prev = lon;
+    }
+    ctx.closePath();
+  }
+
+  function pointInPoly(px, py, pts) {
+    let inside = false;
+    for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+      const xi = pts[i][0], yi = pts[i][1], xj = pts[j][0], yj = pts[j][1];
+      if ((yi > py) !== (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi)
+        inside = !inside;
+    }
+    return inside;
+  }
+
+  (function normalizeCountryLongitudes() {
+    const cents = {};
+    for (const c of DATA.countries) {
+      let s = 0;
+      for (const pt of c.p) s += pt[0];
+      (cents[c.name] = cents[c.name] || []).push(s / c.p.length);
+    }
+    const med = {};
+    for (const [n, ls] of Object.entries(cents)) {
+      ls.sort((a, b) => a - b);
+      med[n] = ls[ls.length >> 1];
+    }
+    for (const c of DATA.countries) {
+      const ref = med[c.name];
+      let cent = 0;
+      for (const pt of c.p) cent += pt[0];
+      cent /= c.p.length;
+      let shift = 0;
+      while (cent + shift - ref >  180) shift -= 360;
+      while (ref - (cent + shift) >  180) shift += 360;
+      if (shift) for (const pt of c.p) pt[0] += shift;
+    }
+  })();
+
+  for (const p of DATA.land) {
+    let m = -999;
+    for (const pt of p.p) if (pt[1] > m) m = pt[1];
+    p.maxLat = m;
+  }
+
+  const countryByName = {};
+  for (let i = 0; i < DATA.countries.length; i++) {
+    const c = DATA.countries[i];
+    if (c.hole || c.name === "Antarctica") continue;
+    (countryByName[c.name] = countryByName[c.name] || []).push(i);
+  }
+
+  for (const c of DATA.countries) {
+    let x0 = 999, x1 = -999, y0 = 999, y1 = -999;
+    for (const pt of c.p) {
+      if (pt[0] < x0) x0 = pt[0]; if (pt[0] > x1) x1 = pt[0];
+      if (pt[1] < y0) y0 = pt[1]; if (pt[1] > y1) y1 = pt[1];
+    }
+    c.bb = [x0, y0, x1, y1];
+  }
+
+  const westernByName = {};
+  for (const c of DATA.countries) if (c.w) westernByName[c.name] = true;
+
+  function hitTest(sx, sy) {
+    const lon = xToLon(sx), lat = yToLat(sy);
+    for (let i = DATA.countries.length - 1; i >= 0; i--) {
+      const c = DATA.countries[i];
+      if (c.hole) continue;
+      const [x0, y0, x1, y1] = c.bb;
+      if (lon < x0 || lon > x1 || lat < y0 || lat > y1) continue;
+      if (pointInPoly(lon, lat, c.p)) return c.name;
+    }
+    return "";
+  }
+
+  function draw() {
+    ctx.fillStyle = OCEAN;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = LAND;
+    for (const p of DATA.land)
+      if (p.k === 0 && p.maxLat > -60) { drawPoly(p.p); ctx.fill(); }
+
+    ctx.fillStyle = OCEAN;
+    for (const p of DATA.land)
+      if (p.k === 1 && p.maxLat > -60) { drawPoly(p.p); ctx.fill(); }
+
+    ctx.fillStyle = LAND_W;
+    for (const c of DATA.countries)
+      if (c.w && !c.hole && c.name !== "Antarctica") { drawPoly(c.p); ctx.fill(); }
+
+    if (hoveredCountry && countryByName[hoveredCountry]) {
+      ctx.fillStyle = westernByName[hoveredCountry] ? LAND_W_HOVER : LAND_HOVER;
+      for (const i of countryByName[hoveredCountry]) { drawPoly(DATA.countries[i].p); ctx.fill(); }
+    }
+
+    const lw = Math.max(0.3, Math.min(1.5, zoom / 20));
+    ctx.strokeStyle = BORDER;
+    ctx.lineWidth = lw;
+    for (const c of DATA.countries)
+      if (!c.hole && c.name !== "Antarctica") { drawPoly(c.p); ctx.stroke(); }
+
+    if (hoveredCountry && countryByName[hoveredCountry]) {
+      ctx.strokeStyle = BORDER_HOVER;
+      ctx.lineWidth = lw * 2;
+      for (const i of countryByName[hoveredCountry]) { drawPoly(DATA.countries[i].p); ctx.stroke(); }
+    }
+  }
+
+  let dragging = false, dragX, dragY, hoveredCountry = "";
+  let mouseX = 0, mouseY = 0, hoverPending = false;
+
+  canvas.addEventListener("mousedown", e => {
+    dragging = true; dragX = e.clientX; dragY = e.clientY;
+    canvas.classList.add("dragging");
+  });
+
+  window.addEventListener("mousemove", e => {
+    mouseX = e.clientX; mouseY = e.clientY;
+    if (dragging) {
+      camX += e.clientX - dragX; camY += e.clientY - dragY;
+      dragX = e.clientX; dragY = e.clientY;
+      clampCamera(); tooltip.style.display = "none"; draw();
+      return;
+    }
+    if (!hoverPending) { hoverPending = true; requestAnimationFrame(doHover); }
+  });
+
+  function doHover() {
+    hoverPending = false;
+    const name = hitTest(mouseX, mouseY);
+    if (name !== hoveredCountry) { hoveredCountry = name; draw(); }
+    if (name) {
+      tooltip.textContent = name;
+      tooltip.style.cssText += `display:block;left:${mouseX+14}px;top:${mouseY-10}px`;
+    } else {
+      tooltip.style.display = "none";
+    }
+  }
+
+  window.addEventListener("mouseup", () => { dragging = false; canvas.classList.remove("dragging"); });
+
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault();
+    const wlon = xToLon(e.clientX), wlat = yToLat(e.clientY);
+    zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom * (e.deltaY < 0 ? 1.15 : 1/1.15)));
+    camX = e.clientX - (wlon + 180) * zoom;
+    camY = e.clientY - (90 - wlat) * zoom;
+    clampCamera(); draw();
+  }, { passive: false });
+
+  window.addEventListener("resize", resize);
+  resize();
+  zoom = Math.max(MIN_ZOOM, H / WORLD_H);
+  camX = (W - WORLD_W * zoom) / 2;
+  camY = (H - WORLD_H * zoom) / 2;
+  clampCamera(); draw();
+}
+
+document.readyState === "loading"
+  ? document.addEventListener("DOMContentLoaded", initMap)
+  : initMap();
+</script>
+</body>
+</html>
